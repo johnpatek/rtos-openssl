@@ -105,7 +105,7 @@ add_definitions( -DOPENSSL_NO_STATIC_ENGINE )
 
 if( MSVC )
   include( MSVCRuntime )
-  configure_msvc_runtime()
+  # configure_msvc_runtime()
   set( OPENSSLDIR "C:/ssl" )
   set( ENGINESDIR "C:/engines-1.1" )
 else()
