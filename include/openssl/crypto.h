@@ -109,6 +109,39 @@ DEFINE_STACK_OF(void)
 # define CRYPTO_EX_INDEX_DRBG            15
 # define CRYPTO_EX_INDEX__COUNT          16
 
+
+#ifndef OPENSSL_RTOS_POOL_SIZE
+#define OPENSSL_RTOS_POOL_SIZE (20 * 1204)
+#endif
+
+struct memory_block
+{
+    struct memory_block * prev;
+    struct memory_block * next;
+    size_t size;
+    uint8_t free;
+};
+
+struct memory_pool
+{
+    uint8_t buffer[OPENSSL_RTOS_POOL_SIZE];
+    size_t free_size;
+};
+
+extern struct memory_pool rtos_pool;
+
+// RTOS Memory Management
+int init_rtos_mempool();
+
+void * rtos_malloc(size_t size);
+
+void * rtos_zalloc(size_t size);
+
+void * rtos_realloc(void * addr, size_t size);
+
+void rtos_free(void * addr);
+
+
 /* No longer needed, so this is a no-op */
 #define OPENSSL_malloc_init() while(0) continue
 

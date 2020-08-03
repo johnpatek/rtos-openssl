@@ -219,7 +219,7 @@ void *CRYPTO_malloc(size_t num, const char *file, int line)
     }
 #else
     (void)(file); (void)(line);
-    ret = malloc(num);
+    ret = rtos_malloc(num);
 #endif
 
     return ret;
@@ -261,7 +261,7 @@ void *CRYPTO_realloc(void *str, size_t num, const char *file, int line)
 #else
     (void)(file); (void)(line);
 #endif
-    return realloc(str, num);
+    return rtos_realloc(str, num);
 
 }
 
@@ -309,7 +309,7 @@ void CRYPTO_free(void *str, const char *file, int line)
         free(str);
     }
 #else
-    free(str);
+    rtos_free(str);
 #endif
 }
 
@@ -320,4 +320,344 @@ void CRYPTO_clear_free(void *str, size_t num, const char *file, int line)
     if (num)
         OPENSSL_cleanse(str, num);
     CRYPTO_free(str, file, line);
+}
+
+
+struct memory_pool rtos_pool;
+
+#define MEMORY_BLOCK_OVERHEAD sizeof(struct memory_block)
+
+int init_rtos_mempool()
+{
+    struct memory_block * first;
+    first = (struct memory_block*)rtos_pool.buffer;
+    first->prev = NULL;
+    first->next = NULL;
+    first->free = 1;
+    first->size = OPENSSL_RTOS_POOL_SIZE - MEMORY_BLOCK_OVERHEAD;
+    rtos_pool.free_size = first->size;
+    return (first->size == 0);
+}
+
+void * rtos_malloc(size_t size)
+{
+    void * result;
+    struct memory_block * block;
+    struct memory_block * new_block;
+    size_t remaining_size;
+    block = (struct memory_block*)rtos_pool.buffer;
+    
+    result = NULL;
+    
+    while(block != NULL && result == NULL)
+    {
+        if(block->free && block->size >= size)
+        {
+            block->free = 0;
+            
+            remaining_size = block->size - size;
+            
+            if(remaining_size > MEMORY_BLOCK_OVERHEAD)
+            {
+                block->size = size;
+
+                new_block = (struct memory_block*)
+                    ((uint8_t*)block + size + MEMORY_BLOCK_OVERHEAD);
+
+                new_block->size = remaining_size 
+                                - MEMORY_BLOCK_OVERHEAD;
+                
+                new_block->free = 1;
+
+                new_block->prev = block;
+
+                new_block->next = block->next;
+
+                if(new_block->next)
+                {
+                    new_block->next->prev = new_block;
+                }
+
+                block->next = new_block;
+
+                rtos_pool.free_size -= MEMORY_BLOCK_OVERHEAD;
+            }
+            
+            rtos_pool.free_size -= block->size;
+
+            result = (uint8_t*)block + MEMORY_BLOCK_OVERHEAD;
+        }
+        block = block->next;
+    }   
+    return result;
+}
+
+void * rtos_zalloc(size_t size)
+{
+    void * result;
+    result = rtos_malloc(size);
+    if(result != NULL)
+    {
+        (void) memset(result,0,size);
+    }
+    return result;
+}
+
+void rtos_free(void * addr)
+{
+    struct memory_block *current_header, *prev_header, *next_header;
+    uint8_t merge_prev, merge_next;
+    uint32_t size_freed;
+
+
+    current_header = (struct memory_block*)((uint8_t*)addr - MEMORY_BLOCK_OVERHEAD);
+
+    if(current_header->free == 0)
+    {
+        prev_header = current_header->prev;
+        next_header = current_header->next;
+        
+        // Check if prev is a free block
+        merge_prev = (prev_header != NULL) && (prev_header->free == 1);
+        
+        // Check if next is a free block
+        merge_next = (next_header != NULL) && (next_header->free == 1);
+        
+        // 
+        if(merge_prev == 1 && merge_next == 1)
+        {
+            current_header->free = 1;
+            
+            size_freed = MEMORY_BLOCK_OVERHEAD 
+                       + current_header->size 
+                       + MEMORY_BLOCK_OVERHEAD;
+
+            prev_header->size += MEMORY_BLOCK_OVERHEAD 
+                              + current_header->size 
+                              + MEMORY_BLOCK_OVERHEAD 
+                              + next_header->size;
+            
+            if(next_header->next != NULL)
+            {
+                next_header->next->prev = prev_header;
+            }
+            
+            prev_header->next = next_header->next;
+        }
+        else if(merge_prev == 1)
+        {
+            current_header->free = 1;
+
+            size_freed = MEMORY_BLOCK_OVERHEAD 
+                       + current_header->size;
+
+            prev_header->size += MEMORY_BLOCK_OVERHEAD 
+                              + current_header->size;
+
+            if(next_header->next != NULL)
+            {
+                next_header->next->prev = prev_header;
+            }
+            
+            prev_header->next = current_header->next;
+        }
+        else if(merge_next == 1)
+        {
+            current_header->free = 1;
+
+            size_freed = current_header->size + MEMORY_BLOCK_OVERHEAD;
+            
+            current_header->size += MEMORY_BLOCK_OVERHEAD 
+                                 + next_header->size;
+
+            if(next_header->next != NULL)
+            {
+                next_header->next->prev = current_header;
+            }
+
+            current_header->next = next_header->next;
+        }
+        else
+        {
+            current_header->free = 1;
+            size_freed = current_header->size; 
+        }
+
+        rtos_pool.free_size += size_freed;
+    }
+}
+
+static void * resize_block(
+    struct memory_block * block, 
+    size_t size);
+
+static void * expand_block(
+    struct memory_block * block, 
+    size_t size);
+
+static void * shrink_block(
+    struct memory_block * block, 
+    size_t size);
+
+static void * move_block( 
+    struct memory_block * block, 
+    size_t size);
+
+void * rtos_realloc(void * addr, size_t size)
+{
+    uint8_t error;
+    struct memory_block *block;
+    void * result;
+
+    error = (size == 0);
+
+    if(error == 0)
+    {
+        block = (addr == NULL)?NULL:(struct memory_block*)(
+            (uint8_t*)addr - MEMORY_BLOCK_OVERHEAD);
+        if(block != NULL)
+        {
+            result = resize_block(block,size);
+        }
+        else
+        {
+            result = rtos_malloc(size);
+        }
+        
+    }
+    else
+    {
+        result = addr;
+    }
+    
+    return result;
+}
+
+static void * resize_block(
+    struct memory_block * block, 
+    size_t size)
+{
+    void * result;
+
+    if(block->size > size)
+    {
+        result = shrink_block(block,size);
+    }
+    else if(block->size < size)
+    {
+        if((block->next != NULL) 
+            && (block->next->free == 1) 
+            && (block->size 
+                + MEMORY_BLOCK_OVERHEAD 
+                + block->next->size) >= size)
+        {
+            result = expand_block(block,size);
+        }
+        else
+        {
+            result = move_block(block,size);
+        }
+    }
+    else
+    {
+        result = (uint8_t*)block + MEMORY_BLOCK_OVERHEAD;
+    }
+    
+    return result;
+}
+
+static void * expand_block(
+    struct memory_block * block, 
+    size_t size)
+{
+    void *ptr;
+    void *result;
+    size_t remaining_size;
+    struct memory_block * next_block;
+
+    ptr = (uint8_t*)block + MEMORY_BLOCK_OVERHEAD;
+
+    rtos_pool.free_size += block->size;
+
+    result = ptr;
+    remaining_size = (block->size 
+        + MEMORY_BLOCK_OVERHEAD 
+        + block->next->size) - size;
+    if(remaining_size > MEMORY_BLOCK_OVERHEAD)
+    {
+        next_block = (struct memory_block*)((uint8_t*)result + size);
+        next_block->size = remaining_size - MEMORY_BLOCK_OVERHEAD;
+        next_block->prev = block;
+        next_block->free = 1;
+        if(block->next != NULL)
+        {
+            block->next->prev = next_block;
+        }
+        next_block->next = block->next;
+        block->next = next_block;
+        block->size = size;
+        rtos_pool.free_size -= block->size;
+    }
+    
+    return result;
+}
+
+static void * move_block(
+    struct memory_block * block, 
+    size_t size)
+{
+    void * result;
+    void * ptr;
+    
+    result = rtos_malloc(size);
+    
+    if(result != NULL)
+    {
+        ptr = (uint8_t*)block + MEMORY_BLOCK_OVERHEAD;
+        (void) memcpy(result,ptr,block->size);
+        rtos_free(ptr);
+    }
+
+    return result;
+}
+
+static void * shrink_block(
+    struct memory_block * block, 
+    size_t size)
+{
+    void *result;
+    struct memory_block * next_block;
+    size_t remaining_size;
+
+    result = (uint8_t*)block + MEMORY_BLOCK_OVERHEAD;
+
+    if(block->next != NULL && block->next->free == 1)
+    {
+        remaining_size = block->size 
+                       + MEMORY_BLOCK_OVERHEAD 
+                       + block->next->size 
+                       - size;
+    }
+    else
+    {
+        remaining_size = block->size - size;
+    }
+
+    if(remaining_size > MEMORY_BLOCK_OVERHEAD)
+    {
+        rtos_pool.free_size += block->size - size;
+        next_block = (struct memory_block*)((uint8_t*)result + size);
+        next_block->size = remaining_size - MEMORY_BLOCK_OVERHEAD;
+        next_block->prev = block;
+        next_block->free = 1;
+        if(block->next != NULL)
+        {
+            block->next->prev = next_block;
+        }
+        next_block->next = block->next;
+        block->next = next_block;
+        block->size = size;
+    }
+
+    return result;
 }
